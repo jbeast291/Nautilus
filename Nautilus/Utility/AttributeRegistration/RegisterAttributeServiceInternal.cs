@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -16,52 +17,60 @@ public sealed partial class RegisterAttributeService
     private readonly List<IDependencyArgumentInjector> _dependencyArgumentInjectors = new();
     private readonly Dictionary<Type, List<object>> _singletons = new();
     private readonly Dictionary<(Type, string), object> _keyedSingletons = new();
-    
+
+    private static readonly List<RegisterMethod> _cachedMethodInfos = new();
+
     private static readonly HashSet<string> _idsRegistered = new();
+
     // the key represents which id the registry is next waiting for.
     // the list of registries is the events waiting for key to be loaded,
     // these will attempt to execute when the key is but may return under a different key if there are still dependencies to check.
     private static readonly Dictionary<string, List<RegisterMethod>> _deferredRegistrations = new();
-    
-    private record RegisterMethod(RegisterAttribute Attribute, MethodInfo MethodInfo, RegisterAttributeService Service);
-    
-    private void ProcessAttributeRegistriesForAssembly(Assembly assemblyToSearch)
+
+    private readonly record struct RegisterMethod(RegisterAttribute Attribute, MethodInfo MethodInfo, RegisterAttributeService Service);
+
+    //NOTE: ran on worker thread
+    private void CacheRegisterMethodsFromAssembly(Assembly assemblyToSearch)
     {
-        foreach (Type type in assemblyToSearch.GetTypes())
+        foreach (var type in assemblyToSearch.GetTypes())
         {
-            foreach (MethodInfo method in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
+            foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
             {
                 RegisterAttribute[] attributes = method.GetCustomAttributes<RegisterAttribute>(inherit: false).ToArray();
-                if (!attributes.Any())
-                {
-                    continue; // no attribute present
-                }
-                
-                // There can only be 1 RegisterEventAttribute (compiler enforced)
-                RegisterAttribute attribute = attributes[0];
 
-                RegisterMethod registerMethod = new RegisterMethod(attribute, method, this);
-                
+                if (!attributes.Any()) continue; // no attribute present
+
+                RegisterAttribute attribute = attributes[0];
+                RegisterMethod registerMethod = new(attribute, method, this);
+
                 if (!AttributeShouldRegister(registerMethod)) continue;
-                
-                HandleRegisterMethod(registerMethod);
+
+                _cachedMethodInfos.Add(registerMethod);
             }
         }
     }
-    
-    private void HandleRegisterMethod(RegisterMethod registerMethod)
+
+    private IEnumerator ProcessAttributeRegistries()
+    {
+        foreach (var registerMethod in _cachedMethodInfos)
+        {
+            yield return HandleRegisterMethod(registerMethod);
+        }
+    }
+
+    private IEnumerator HandleRegisterMethod(RegisterMethod registerMethod)
     {
         string globalRegistryID = GetGlobalRegistryID(registerMethod.Attribute.RegistryID);
-        
+
         if (_idsRegistered.Contains(globalRegistryID))
         {
             throw new Exception($"Duplicate registry ID found: {registerMethod.Attribute.RegistryID}!");
         }
-        
+
         if (AreDependenciesFulfilled(registerMethod.Attribute, out string firstFailedGlobalDependency))
         {
-            registerMethod.Service.ExecuteMethodUnsafe(registerMethod);
-            return;
+            yield return registerMethod.Service.ExecuteMethod(registerMethod);
+            yield break;
         }
 
         if (IsDependencyCyclic(globalRegistryID, firstFailedGlobalDependency, out string chain))
@@ -80,7 +89,7 @@ public sealed partial class RegisterAttributeService
             _deferredRegistrations.Add(firstFailedGlobalDependency, newDependentList);
         }
     }
-    
+
     private bool IsDependencyCyclic(string registryID, string dependencyID, out string chain)
     {
         if (registryID == dependencyID)
@@ -88,7 +97,7 @@ public sealed partial class RegisterAttributeService
             chain = $"{registryID},{dependencyID}";
             return true;
         }
-        
+
         Stack<(string registry, string pathTraversed)> toVisit = new();
         HashSet<string> visited = new();
 
@@ -110,7 +119,7 @@ public sealed partial class RegisterAttributeService
                 {
                     path += $",{dependencyID}";
                     path += $",{registryID}";// Add the start to the end to clearly show the path loops
-                    
+
                     // The _deferredRegistrations stores dependencies in reverse (ID, attributes waiting on ID) to how the Attributes are set up.
                     // This has the benefit of only checking deferred registration for cyclic issues, but we have to reverse at the very end to make it logical to what they typed.
                     chain = string.Join(" -> ", path.Split(',').Reverse());
@@ -131,33 +140,33 @@ public sealed partial class RegisterAttributeService
             firstUnloadedGlobalDependency = null;
             return true;
         }
-        
+
         foreach (string dependentID in registryAttribute.LoadAfterIDs)
         {
             string globalDependencyId = GetGlobalRegistryID(dependentID);
-            
+
             if (_idsRegistered.Contains(globalDependencyId)) continue;
-            
+
             firstUnloadedGlobalDependency = globalDependencyId;
             return false;
         }
         firstUnloadedGlobalDependency = null;
         return true;
     }
-    
-    private void ExecuteMethodUnsafe(RegisterMethod registerMethod)
+
+    private IEnumerator ExecuteMethod(RegisterMethod registerMethod)
     {
         if (Initializer.ConfigFile.enableDebugLogs)
             InternalLogger.Info($"Executing registry '{registerMethod.Attribute.RegistryID}' from '{registerMethod.MethodInfo.DeclaringType}'");
-        
+
         ParameterInfo[] parameters = registerMethod.MethodInfo.GetParameters();
-        object[] parameterValues = new object[parameters.Length];
-        
+        var parameterValues = new object[parameters.Length];
+
         for (int i = 0; i < parameters.Length; i++)
         {
             ParameterInfo parameterInfo = parameters[i];
             InjectionContext context = new InjectionContext(registerMethod.Attribute, parameterInfo, registerMethod.MethodInfo,this);
-            
+
             if (TryDependencyInject(context, out object value))
             {
                 parameterValues[i] = value;
@@ -167,16 +176,25 @@ public sealed partial class RegisterAttributeService
                 throw new Exception($"No injector/singleton found for {parameterInfo.Name} when registering {context.Attribute.RegistryID}");
             }
         }
-        
-        registerMethod.MethodInfo.Invoke(null, parameterValues);
+
+        //Execute method. Handles async and sync
+        var result =  registerMethod.MethodInfo.Invoke(null, parameterValues);
+        if (result is IEnumerator coroutine)
+        {
+            yield return coroutine;
+        }
+
         string globalRegistryId = GetGlobalRegistryID(registerMethod.Attribute.RegistryID);
         _idsRegistered.Add(globalRegistryId);
-                
-        // check and load for any that depended on this ID
-        if (!_deferredRegistrations.TryGetValue(globalRegistryId, out var list)) return;
-        // remove the dependency from the deferred list, saves a bit of memory but not technically required.
+
+        // check and execute any that are waiting on this ID
+        if (!_deferredRegistrations.TryGetValue(globalRegistryId, out var deferredMethods)) yield break;
+
         _deferredRegistrations.Remove(globalRegistryId);
-        list.ForEach(HandleRegisterMethod);
+        foreach (var deferredMethod in deferredMethods)
+        {
+            yield return HandleRegisterMethod(deferredMethod);
+        }
     }
 
     // Priority: Attribute injector > Type of argument injector > Argument name injector.
@@ -198,11 +216,11 @@ public sealed partial class RegisterAttributeService
             valueToInject = value;
             return true;
         }
-        
+
         foreach (IDependencyArgumentInjector injector in _dependencyArgumentInjectors)
         {
             if (!injector.TryInjectToArgument(context, out object value)) continue;
-            
+
             valueToInject = value;
             return true;
         }
@@ -224,12 +242,12 @@ public sealed partial class RegisterAttributeService
         IEnumerable<IRegistryRequirement> registryRequirements = registerMethod.MethodInfo
             .GetCustomAttributes(true)
             .OfType<IRegistryRequirement>();
-        
+
         foreach (IRegistryRequirement registryRequirement in registryRequirements)
         {
             if (!registryRequirement.RequirementsMet()) return false;
         }
-        
+
         return true;
     }
 
@@ -242,7 +260,7 @@ public sealed partial class RegisterAttributeService
         }
         return _modGuid + "::" + registryID;
     }
-    
+
     internal static void LogErrorsForUnloadedDependencies()
     {
         foreach (KeyValuePair<string, List<RegisterMethod>> unloadedRegistryID in _deferredRegistrations)

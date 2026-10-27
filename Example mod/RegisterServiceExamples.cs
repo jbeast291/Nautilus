@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Reflection;
 using BepInEx;
 using Nautilus.Assets;
@@ -79,12 +80,13 @@ public class RegisterServiceExamples : BaseUnityPlugin
     }
 
     // Now, to have Nautilus execute your registries, you must use the RegistryEventUtils
-    private void Awake()
+    private IEnumerator Awake()
     {
         RegisterAttributeService service = new RegisterAttributeService(this);
         service.AddBasicInjectors();// This adds several injectors built into Nautilus. 
         // Custom injectors can be defined here and added as well, but this is not needed for most use cases
-        service.ExecuteAssemblyRegisterAttributes(Assembly.GetExecutingAssembly());
+        yield return service.CacheAssemblyRegisterMethodsAsync(Assembly.GetExecutingAssembly());
+        yield return service.ExecuteCachedMethodsAsync();
         /* 
          If you need more debug info, enable Nautilus's Debug toggle in settings.
          RegistryEventUtils will log every time a registry is executed.

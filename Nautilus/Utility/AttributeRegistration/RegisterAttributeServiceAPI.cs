@@ -1,6 +1,8 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Threading.Tasks;
 using BepInEx;
 using Nautilus.Assets;
 using Nautilus.Utility.AttributeRegistration.Injectors;
@@ -115,14 +117,21 @@ public sealed partial class RegisterAttributeService
         }
         return default;
     }
-    
+
+    //TODO
+    public IEnumerator CacheAssemblyRegisterMethodsAsync(Assembly assemblyToSearch)
+    {
+        var t = Task.Run(() => CacheRegisterMethodsFromAssembly(assemblyToSearch));
+        yield return AsyncUtils.WaitUntilTaskComplete(t);
+    }
+
     /// <summary>
     /// Search an <see cref="Assembly"/> and execute every public/nonpublic static method attached with a <see cref="RegisterAttribute"/>.
     /// Method parameters are automatically processed depending on the defined <see cref="IDependencyArgumentInjector">IDependencyArgumentInjectors</see>.
     /// </summary>
     /// <param name="assemblyToSearch">The <see cref="Assembly"/> for which all types will be checked for static methods marked with the <see cref="RegisterAttribute"/>.</param>
-    public void ExecuteAssemblyRegisterAttributes(Assembly assemblyToSearch)
+    public IEnumerator ExecuteCachedMethodsAsync()
     {
-        ProcessAttributeRegistriesForAssembly(assemblyToSearch);
+        yield return ProcessAttributeRegistries();
     }
 }
